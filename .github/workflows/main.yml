@@ -100,7 +100,7 @@ jobs:
           cp -r linux-firmware/rtlwifi ${{ github.workspace }}/initramfs_root/lib/firmware/
 
       # ------------------------------------------------------------
-      # 5. 组装 initramfs (DHCP 版 rcS，添加 udhcpc 脚本)
+      # 5. 组装 initramfs (DHCP 版 rcS，修复 dropbear 路径)
       # ------------------------------------------------------------
       - name: Assemble initramfs
         run: |
@@ -111,11 +111,11 @@ jobs:
           echo "root::0:0:99999:7:::" > etc/shadow
           chmod 600 etc/shadow
 
-          # 生成 dropbear 密钥
+          # 生成 dropbear 密钥 (修正路径：dropbearkey 在 bin 目录下)
           mkdir -p /tmp/dropbear_keys
-          ${{ github.workspace }}/initramfs_root/usr/bin/dropbearkey -t rsa -f /tmp/dropbear_keys/dropbear_rsa_host_key
-          ${{ github.workspace }}/initramfs_root/usr/bin/dropbearkey -t ecdsa -f /tmp/dropbear_keys/dropbear_ecdsa_host_key
-          ${{ github.workspace }}/initramfs_root/usr/bin/dropbearkey -t ed25519 -f /tmp/dropbear_keys/dropbear_ed25519_host_key
+          ${{ github.workspace }}/initramfs_root/bin/dropbearkey -t rsa -f /tmp/dropbear_keys/dropbear_rsa_host_key
+          ${{ github.workspace }}/initramfs_root/bin/dropbearkey -t ecdsa -f /tmp/dropbear_keys/dropbear_ecdsa_host_key
+          ${{ github.workspace }}/initramfs_root/bin/dropbearkey -t ed25519 -f /tmp/dropbear_keys/dropbear_ed25519_host_key
           mkdir -p etc/dropbear
           cp /tmp/dropbear_keys/* etc/dropbear/
 
@@ -137,7 +137,7 @@ jobs:
           EOF
           chmod +x usr/share/udhcpc/default.script
 
-          # 创建启动脚本 rcS (DHCP)
+          # 创建启动脚本 rcS (DHCP) - 修正 dropbear 路径为 /sbin/dropbear
           cat > etc/init.d/rcS << 'EOF'
           #!/bin/sh
           mount -t proc proc /proc
@@ -158,8 +158,8 @@ jobs:
           echo "Starting DHCP on eth0..."
           udhcpc -i eth0 -q
 
-          # 启动 dropbear SSH 服务 (允许空密码)
-          /usr/sbin/dropbear -R -E -p 22 -B
+          # 启动 dropbear SSH 服务 (允许空密码) - 修正路径
+          /sbin/dropbear -R -E -p 22 -B
 
           echo "=== SSH system ready. root password is 'root' ==="
           /bin/sh
