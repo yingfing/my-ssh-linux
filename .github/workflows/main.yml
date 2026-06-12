@@ -1,0 +1,216 @@
+name: Build Minimal SSH System ISO (DHCP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: true
+        default: 'latest'
+      release_name:
+        description: 'Release name'
+        required: true
+        default: 'Custom SSH System (DHCP)'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential bc kmod cpio flex bison libssl-dev libelf-dev \
+            isolinux xorriso grub-pc-bin grub-efi-amd64-bin mtools dosfstools
+
+      # ------------------------------------------------------------
+      # 1. 编译内核 (配置与之前相同)
+      # ------------------------------------------------------------
+      - name: Build Linux Kernel
+        run: |
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.30.tar.xz
+          tar -xf linux-6.6.30.tar.xz
+          cd linux-6.6.30
+          make defconfig
+          ./scripts/config --enable CONFIG_UNIX98_PTYS
+          ./scripts/config --enable CONFIG_DEVTMPFS
+          ./scripts/config --enable CONFIG_PROC_FS
+          ./scripts/config --enable CONFIG_SYSFS
+          ./scripts/config --enable CONFIG_TMPFS
+          ./scripts/config --enable CONFIG_INET
+          ./scripts/config --enable CONFIG_NET
+          ./scripts/config --enable CONFIG_PCI
+          ./scripts/config --enable CONFIG_R8169
+          ./scripts/config --module CONFIG_R8169
+          ./scripts/config --enable CONFIG_RTLWIFI
+          ./scripts/config --enable CONFIG_RTL8192CE
+          ./scripts/config --module CONFIG_RTL8192CE
+          ./scripts/config --enable CONFIG_MODULES
+          ./scripts/config --enable CONFIG_MODULE_UNLOAD
+          ./scripts/config --disable CONFIG_SOUND
+          ./scripts/config --disable CONFIG_DRM
+          ./scripts/config --disable CONFIG_INPUT_MOUSEDEV
+          make olddefconfig
+          make -j$(nproc) bzImage
+          make -j$(nproc) modules
+          mkdir -p ${{ github.workspace }}/initramfs_root/lib/modules
+          INSTALL_MOD_PATH=${{ github.workspace }}/initramfs_root make modules_install
+          cp arch/x86/boot/bzImage ${{ github.workspace }}/bzImage
+
+      # ------------------------------------------------------------
+      # 2. 编译 BusyBox (静态)
+      # ------------------------------------------------------------
+      - name: Build BusyBox
+        run: |
+          wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+          tar -xf busybox-1.36.1.tar.bz2
+          cd busybox-1.36.1
+          make defconfig
+          sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' .config
+          make -j$(nproc)
+          make CONFIG_PREFIX=${{ github.workspace }}/initramfs_root install
+
+      # ------------------------------------------------------------
+      # 3. 编译 Dropbear (静态)
+      # ------------------------------------------------------------
+      - name: Build Dropbear
+        run: |
+          wget https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.85.tar.bz2
+          tar -xf dropbear-2024.85.tar.bz2
+          cd dropbear-2024.85
+          ./configure --prefix=/ --host=x86_64-linux-gnu
+          make PROGRAMS="dropbear dropbearkey dbclient scp" -j$(nproc)
+          make PROGRAMS="dropbear dropbearkey dbclient scp" install DESTDIR=${{ github.workspace }}/initramfs_root
+
+      # ------------------------------------------------------------
+      # 4. 获取无线固件
+      # ------------------------------------------------------------
+      - name: Fetch linux-firmware
+        run: |
+          git clone --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+          mkdir -p ${{ github.workspace }}/initramfs_root/lib/firmware
+          cp -r linux-firmware/rtlwifi ${{ github.workspace }}/initramfs_root/lib/firmware/
+
+      # ------------------------------------------------------------
+      # 5. 组装 initramfs (使用 DHCP)
+      # ------------------------------------------------------------
+      - name: Assemble initramfs
+        run: |
+          cd ${{ github.workspace }}/initramfs_root
+          mkdir -p dev proc sys etc/init.d root var/empty var/run tmp etc/dropbear
+          echo "root:x:0:0:root:/root:/bin/sh" > etc/passwd
+          echo "root::0:0:99999:7:::" > etc/shadow
+          chmod 600 etc/shadow
+
+          # 生成 dropbear 密钥
+          mkdir -p /tmp/dropbear_keys
+          ${{ github.workspace }}/initramfs_root/usr/bin/dropbearkey -t rsa -f /tmp/dropbear_keys/dropbear_rsa_host_key
+          ${{ github.workspace }}/initramfs_root/usr/bin/dropbearkey -t ecdsa -f /tmp/dropbear_keys/dropbear_ecdsa_host_key
+          ${{ github.workspace }}/initramfs_root/usr/bin/dropbearkey -t ed25519 -f /tmp/dropbear_keys/dropbear_ed25519_host_key
+          mkdir -p etc/dropbear
+          cp /tmp/dropbear_keys/* etc/dropbear/
+
+          # 创建启动脚本 rcS (DHCP 版本)
+          cat > etc/init.d/rcS << 'EOF'
+          #!/bin/sh
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          mount -t tmpfs tmpfs /tmp
+
+          # 加载网卡驱动
+          modprobe r8169
+          modprobe rtl8192ce
+
+          sleep 2
+
+          # 配置 loopback
+          ifconfig lo 127.0.0.1 up
+
+          # 使用 DHCP 获取 IP (eth0)
+          echo "Starting DHCP on eth0..."
+          udhcpc -i eth0 -q
+
+          # 启动 SSH 服务
+          /usr/sbin/dropbear -R -E -p 22 -B
+
+          echo "=== SSH system ready. root password is 'root' ==="
+          /bin/sh
+          EOF
+          chmod +x etc/init.d/rcS
+          ln -s etc/init.d/rcS init
+
+          find . -print0 | cpio --null -o --format=newc | gzip -9 > ${{ github.workspace }}/initramfs.cpio.gz
+
+      # ------------------------------------------------------------
+      # 6. 生成混合 ISO
+      # ------------------------------------------------------------
+      - name: Create hybrid ISO
+        run: |
+          mkdir -p iso_root/boot iso_root/EFI/BOOT iso_root/isolinux
+          cp ${{ github.workspace }}/bzImage iso_root/boot/bzImage
+          cp ${{ github.workspace }}/initramfs.cpio.gz iso_root/boot/initramfs.cpio.gz
+
+          cat > iso_root/isolinux/isolinux.cfg << 'EOF'
+          DEFAULT custom
+          LABEL custom
+            KERNEL /boot/bzImage
+            APPEND initrd=/boot/initramfs.cpio.gz console=tty0 console=ttyS0
+          EOF
+          cp /usr/lib/ISOLINUX/isolinux.bin iso_root/isolinux/
+          cp /usr/lib/syslinux/modules/bios/ldlinux.c32 iso_root/isolinux/
+
+          cat > iso_root/boot/grub.cfg << 'EOF'
+          set default=0
+          set timeout=5
+          menuentry "Custom SSH System" {
+            linux /boot/bzImage console=tty0 console=ttyS0
+            initrd /boot/initramfs.cpio.gz
+          }
+          EOF
+
+          dd if=/dev/zero of=efi.img bs=1M count=20
+          mkfs.vfat efi.img
+          mkdir -p efi_mnt
+          sudo mount efi.img efi_mnt
+          sudo mkdir -p efi_mnt/EFI/BOOT
+          sudo grub-mkstandalone --directory=/usr/lib/grub/x86_64-efi \
+            --format=x86_64-efi --output=efi_mnt/EFI/BOOT/BOOTX64.EFI \
+            "boot/grub/grub.cfg=/dev/null"
+          sudo cp iso_root/boot/grub.cfg efi_mnt/boot/grub/
+          sudo umount efi_mnt
+          rmdir efi_mnt
+          cp efi.img iso_root/efi.img
+
+          xorriso -as mkisofs \
+            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+            -b isolinux/isolinux.bin -c isolinux/boot.cat \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot -e efi.img -no-emul-boot \
+            -o ${{ github.workspace }}/custom-system.iso iso_root/
+
+      # ------------------------------------------------------------
+      # 7. 创建 Release 并上传
+      # ------------------------------------------------------------
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: ${{ github.event.inputs.release_name }}
+          body: |
+            ### 自定义 SSH 系统 ISO (DHCP 自动获取 IP)
+            - 内核: 6.6.30
+            - BusyBox 1.36.1, Dropbear 2024.85
+            - 支持网卡: Realtek R8169 (有线), RTL8192CE (无线)
+            - 网络配置: 自动 DHCP (eth0)
+            - 默认 root 密码: `root`
+          files: ${{ github.workspace }}/custom-system.iso
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
